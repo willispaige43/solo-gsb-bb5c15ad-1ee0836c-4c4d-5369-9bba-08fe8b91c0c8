@@ -107,6 +107,22 @@ LATER of that readiness instant and the tenant's existing aging settlement
 point. A head job queued for 60 minutes whose prerequisite completed one
 minute before the batch therefore earns one minute of aging, not sixty.
 
+The settlement watermark (``tenants.aging_settled_at``) only moves
+FORWARD during one continuous queued period. Batch reference instants are
+injectable, so an out-of-order batch (an earlier ``now`` after a later one
+was already committed) must never turn the watermark backwards: doing so
+would let the already-settled interval be credited again by a subsequent
+later batch (settle at 00:10, re-settle at 00:05, settle at 00:10 pays the
+00:05..00:10 wait twice). Every written checkpoint is therefore the LATER
+of the stored watermark, the head's true readiness instant and the batch
+reference instant; an earlier batch simply re-confirms the existing
+watermark and grants nothing. Preview and committed batch run this one
+shared settlement, so both honour the same watermark and the ledger stays
+consistent. The watermark resets to NULL only when the tenant's queue
+drains (dispatch, cancellation or cancel-cascade); a freshly submitted job
+afterwards starts a brand-new wait window measured from its own arrival.
+
+
 Reproducibility
 ===============
 Tenant visit order is tenant-id ascending, jobs are FIFO per tenant, job ids
@@ -2221,27 +2237,65 @@ def _batch_tx_body(
     # Dependency-blocked tenants receive nothing, but their checkpoint is
     # advanced: once dependencies release them, waiting is measured from
     # the release point rather than the original submission.
+    #
+    # The aging watermark is strictly monotone *during one continuous
+    # queued period*: a batch whose reference ``now`` is earlier than a
+    # previously settled batch (out-of-order/retroactive ``now``) must not
+    # turn the clock backwards, or the already-compensated interval would
+    # be credited a second time when a later batch then moves it forward
+    # again (settle at 00:10, re-settle at 00:05, settle at 00:10 -> the
+    # 00:05..00:10 aging is paid twice). Every checkpoint written here is
+    # therefore the LATER of (a) the tenant's already stored watermark,
+    # (b) the head job's true readiness instant, and (c) the batch
+    # reference instant; an earlier batch simply re-confirms the existing
+    # watermark and grants nothing. Only a drained queue resets the clock
+    # to NULL, so a freshly submitted job starts a brand-new wait window
+    # measured from its own arrival.
     for t in active:
-        if t["tenant_id"] not in ready_at_start:
-            conn.execute(
-                "UPDATE tenants SET aging_settled_at = ?, updated_at = ? "
-                "WHERE id = ?",
-                (now_str, now_str, t["tenant_id"]),
-            )
-            continue
+        tenant_id = t["tenant_id"]
         # Oldest queued job and the head's readiness instant both come from
         # the one-shot snapshot above (queues are FIFO, so the first row is
         # the oldest as well as the head).
-        oldest = queues[t["tenant_id"]][0]["queued_at"]
-        base = t["aging_settled_at"] or oldest
-        base_dt = _as_utc(_parse_iso(base))
-        head = head_of(t["tenant_id"])
+        oldest_dt = _as_utc(
+            _parse_iso(queues[tenant_id][0]["queued_at"])
+        )
+        stored = t["aging_settled_at"]
+        stored_dt = (
+            _as_utc(_parse_iso(stored)) if stored is not None else None
+        )
+
+        if tenant_id not in ready_at_start:
+            # Dependency-blocked: no aging credit, ever. Still move the
+            # checkpoint past any *blocked* time, but only forward — an
+            # earlier batch never pulls it back. When the blockage later
+            # lifts, the ready branch below additionally floors the wait at
+            # the actual readiness instant, so waiting is never measured
+            # before the head truly became schedulable.
+            if stored_dt is None or now_dt > stored_dt:
+                checkpoint_dt = now_dt
+            else:
+                checkpoint_dt = stored_dt
+            conn.execute(
+                "UPDATE tenants SET aging_settled_at = ?, updated_at = ? "
+                "WHERE id = ?",
+                (checkpoint_dt.isoformat(), checkpoint_dt.isoformat(),
+                 tenant_id),
+            )
+            continue
+
+        head = head_of(tenant_id)
         ready_dt = _ready_since(head, done_at.get(head["id"]))
-        if ready_dt > base_dt:
-            base_dt = ready_dt
-        waited_min = (
-            _parse_iso(now_str) - base_dt
-        ).total_seconds() / 60.0
+        # The wait lower bound is the LATEST of the job's arrival, the true
+        # readiness instant and the already-settled watermark. After a
+        # dependency blockage this keeps the actual readiness moment as the
+        # wait floor; after a later-committed batch it keeps the watermark,
+        # so an earlier batch can never re-credit a settled interval.
+        floor_dt = oldest_dt
+        if stored_dt is not None and stored_dt > floor_dt:
+            floor_dt = stored_dt
+        if ready_dt > floor_dt:
+            floor_dt = ready_dt
+        waited_min = (now_dt - floor_dt).total_seconds() / 60.0
         if waited_min < 0:
             waited_min = 0.0
         bonus = settings.aging_rate_gpu_min_per_min * waited_min
@@ -2249,14 +2303,20 @@ def _batch_tx_body(
             bonus = min(bonus, settings.aging_cap_gpu_min)
         if bonus >= _EPS:
             _credit(
-                conn, t["tenant_id"], bonus, "AGING", now_str,
+                conn, tenant_id, bonus, "AGING", now_str,
                 batch_id=batch_id,
                 detail=f"waited {waited_min:.3f} min",
             )
+        # Monotone watermark: never earlier than the stored point, the
+        # readiness instant (both already in floor_dt) or this batch's
+        # reference instant. An out-of-order earlier batch therefore leaves
+        # the watermark exactly where the later batch had advanced it.
+        checkpoint_dt = floor_dt if floor_dt > now_dt else now_dt
         conn.execute(
             "UPDATE tenants SET aging_settled_at = ?, updated_at = ? "
             "WHERE id = ?",
-            (now_str, now_str, t["tenant_id"]),
+            (checkpoint_dt.isoformat(), checkpoint_dt.isoformat(),
+             tenant_id),
         )
 
     if available <= 0:
@@ -2393,18 +2453,16 @@ def _batch_tx_body(
     # ledger untouched.
     rollback_uncommitted()
 
-    # Close aging windows for tenants whose queue drained; others keep
-    # accruing wait time from this batch's reference instant. Drained is
-    # decided from the cursor against the same in-memory FIFO snapshot:
-    # every row before the cursor was dispatched, so a cursor at the end
-    # means no QUEUED job remains for that tenant.
+    # Close aging windows for tenants whose queue drained; the others keep
+    # the monotone watermark the start-of-batch settlement already wrote.
+    # Drained is decided from the cursor against the same in-memory FIFO
+    # snapshot: every row before the cursor was dispatched, so a cursor at
+    # the end means no QUEUED job remains for that tenant. Resetting to NULL
+    # here is the ONLY way the watermark moves backwards, and it is exactly
+    # the "new wait period starts with a newly submitted job" rule: once the
+    # queue is empty there is no continuous queued period left to protect.
     for tenant_id in active_ids:
-        if cursor[tenant_id] < len(queues[tenant_id]):
-            conn.execute(
-                "UPDATE tenants SET aging_settled_at = ? WHERE id = ?",
-                (now_str, tenant_id),
-            )
-        else:
+        if cursor[tenant_id] >= len(queues[tenant_id]):
             conn.execute(
                 "UPDATE tenants SET aging_settled_at = NULL WHERE id = ?",
                 (tenant_id,),
